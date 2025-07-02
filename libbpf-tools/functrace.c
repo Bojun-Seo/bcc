@@ -275,9 +275,9 @@ int main(int argc, char **argv)
 
 	printf("Tracing %s.  Hit Ctrl-C to exit\n", env.target);
 	if (env.duration)
-		printf("Timestamp\tDuration\tpid\ttid\tFunc\n");
+		printf("Timestamp\tDuration\tpid\ttid\tFunc\tArg\n");
 	else
-		printf("Timestamp\tpid\ttid\tFunc\n");
+		printf("Timestamp\tpid\ttid\tFunc\tArg\n");
 
 	sleep(env.interval);
 
@@ -314,7 +314,7 @@ int main(int argc, char **argv)
 			strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", tm_info);
 			fprintf(os, "%s", buffer);
 		}
-		fprintf(os, "\t%d\t%d\t%s\n", pid, tid, env.symbolname);
+		fprintf(os, "\t%d\t%d\t%s\t%llu\n", pid, tid, env.symbolname, info.data);
 		key = next_key;
 	} while (bpf_map_get_next_key(fd, &key, &next_key) == 0);
 
