@@ -32,11 +32,13 @@ static struct prog_env {
 	char *target;
 	char *bin_path;
 	char *symbolname;
+	bool trace_kernel;
 	bool duration;
 	bool verbose;
 } env = {
 	.interval = 99999999,
 	.file_output = NULL,
+	.trace_kernel = false,
 	.duration = false,
 	.verbose = false,
 };
@@ -51,12 +53,14 @@ static const char program_doc[] =
 "Usage: functrace [OPTIONS...] -p PID BIN_PATH:FUNCTION\n"
 "\n"
 "Examples:\n"
+"  ./functrace -k ip_send_skb                        # trace kernel function ip_send_skb\n"
 "  ./functrace -p 181 /lib/libc.so:read              # trace the read() library function\n"
 "  ./functrace -p 181 -o my.log /lib/libc.so:read    # save logs on my.log file\n"
 "  ./functrace -p 181 -d /lib/libc.so:read           # change time unit to ns and print duration\n"
 ;
 
 static const struct argp_option opts[] = {
+	{ "kernel", 'k', NULL, 0, "Trace kernel", 0 },
 	{ "pid", 'p', "PID", 0, "Process ID to trace", 0 },
 	{ "interval", 'i', "INTERVAL", 0, "Quit interval in seconds", 0 },
 	{ "output", 'o', "FILE", 0,
@@ -74,6 +78,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 	long interval, pid;
 
 	switch (key) {
+	case 'k':
+		env->trace_kernel = true;
+		break;
 	case 'p':
 		errno = 0;
 		pid = strtol(arg, NULL, 10);
@@ -180,6 +187,31 @@ static int attach_uprobe(struct functrace_bpf *obj, char* bin_path, char* functi
 	return attach_uprobe_with_offset(obj, bin_path, function, func_off);
 }
 
+static int attach_kprobe(struct functrace_bpf *obj, char *function)
+{
+	long err;
+
+	obj->links.dummy_kprobe =
+		bpf_program__attach_kprobe(obj->progs.dummy_kprobe, false,
+					  function);
+	if (!obj->links.dummy_kprobe) {
+		err = -errno;
+		warn("Failed to attach kprobe: %ld\n", err);
+		return -2;
+	}
+
+	obj->links.dummy_kretprobe =
+		bpf_program__attach_kprobe(obj->progs.dummy_kretprobe, false,
+					  function);
+	if (!obj->links.dummy_kretprobe) {
+		err = -errno;
+		warn("Failed to attach kretprobe: %ld\n", err);
+		return -3;
+	}
+
+	return 0;
+}
+
 static void sig_hand(int signr)
 {
 }
@@ -240,34 +272,42 @@ int main(int argc, char **argv)
 
 	fd = bpf_map__fd(obj->maps.infos);
 
-	env.bin_path = strdup(env.target);
-	if (!env.bin_path) {
-		warn("strdup failed");
-		return 1;
-	}
+	if (!env.trace_kernel) {
+		env.bin_path = strdup(env.target);
+		if (!env.bin_path) {
+			warn("strdup failed");
+			return 1;
+		}
 
-	env.symbolname = strchr(env.bin_path, ':');
-	if (!env.symbolname) {
-		warn("Binary should have contained ':' (internal bug!)\n");
-		return 1;
-	}
-	*env.symbolname = '\0';
-	env.symbolname++;
+		env.symbolname = strchr(env.bin_path, ':');
+		if (!env.symbolname) {
+			warn("Binary should have contained ':' (internal bug!)\n");
+			return 1;
+		}
+		*env.symbolname = '\0';
+		env.symbolname++;
 
-	err = attach_uprobe(obj, env.bin_path, env.symbolname);
-	if (err)
-		goto cleanup;
+		err = attach_uprobe(obj, env.bin_path, env.symbolname);
+		if (err)
+			goto cleanup;
+
+		syms_cache = syms_cache__new(0);
+		if (!syms_cache) {
+			fprintf(stderr, "failed to load syms_cache\n");
+			goto cleanup;
+		}
+	} else {
+		err = attach_kprobe(obj, env.target);
+		if (err)
+			goto cleanup;
+
+		env.symbolname = env.target;
+	}
 
 	err = functrace_bpf__attach(obj);
 	if (err) {
 		fprintf(stderr, "failed to attach BPF programs: %s\n",
 			strerror(-err));
-		goto cleanup;
-	}
-
-	syms_cache = syms_cache__new(0);
-	if (!syms_cache) {
-		fprintf(stderr, "failed to load syms_cache\n");
 		goto cleanup;
 	}
 
