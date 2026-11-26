@@ -3,7 +3,7 @@
 pageowner \- Show the owners of outstanding page allocations, like page_owner.
 Uses Linux eBPF/bcc.
 .SH SYNOPSIS
-.B pageowner [\-h] [\-v] [\-p PID] [\-T TOP] [\-d] [\-\-max\-allocs MAX_ALLOCS]
+.B pageowner [\-h] [\-v] [\-p PID] [\-T TOP] [\-d | \-C] [\-\-max\-allocs MAX_ALLOCS]
 .B [\-\-stack\-storage\-size SIZE] [\-\-perf\-max\-stack\-depth DEPTH]
 .B [interval] [count]
 .SH DESCRIPTION
@@ -20,7 +20,10 @@ or memory held in pipes or socket buffers, and which code paths allocate pages
 that cause fragmentation. With \-d, pageowner instead prints each outstanding
 allocation in the format of /sys/kernel/debug/page_owner, so that the output
 can be post-processed by tools written for page_owner, such as page_owner_sort
-in tools/mm of the kernel source.
+in tools/mm of the kernel source. With \-C, pageowner only counts the
+outstanding pages of each stack trace in the kernel, like
+/sys/kernel/debug/page_owner_stacks/show_stacks, which takes less memory and
+makes reports cheap, e.g. to watch the pages over a long time.
 
 This is like page_owner of the kernel (Documentation/mm/page_owner.rst), but
 works on kernels built without CONFIG_PAGE_OWNER or booted without
@@ -59,6 +62,11 @@ The default is 10. Ignored with \-d.
 Print each outstanding allocation in the format of
 /sys/kernel/debug/page_owner, ordered by PFN, instead of the summary.
 .TP
+\-C
+Only count the outstanding pages of each stack trace, in the kernel, instead
+of recording the owner of each allocation. This takes less memory and makes
+reports cheap, but cannot be used with \-d.
+.TP
 \-\-max\-allocs MAX_ALLOCS
 The number of outstanding allocations that can be tracked. The default is
 1048576, or the number of pages in the system if that is smaller.
@@ -92,6 +100,10 @@ Show only the top 3 stacks:
 #
 .B pageowner \-T 3
 .TP
+Count the outstanding pages of each stack in the kernel, and summarize them every minute:
+#
+.B pageowner \-C 60
+.TP
 Save the outstanding allocations in page_owner format, and sort them by memory with page_owner_sort of the kernel:
 #
 .B pageowner \-d > page_owner_full.txt
@@ -106,7 +118,8 @@ The number of outstanding pages allocated from the stack trace, and their
 size in KiB.
 .TP
 allocations
-The number of allocations these pages belong to.
+The number of allocations these pages belong to. With \-C, an allocation
+that was split and partly freed is counted once for each remaining block.
 .PP
 The dump (\-d) shows, for each outstanding allocation:
 .TP
@@ -150,7 +163,13 @@ them cheaper.
 The hash map of the owners is preallocated, and takes about 120 bytes of
 kernel memory for each allocation that it can track: about 125 MB for 1048576
 allocations, the default unless the system has fewer pages. Use
-\-\-max\-allocs to reduce it. The stack traces take about 10 MB by default.
+\-\-max\-allocs to reduce it, or \-C, which takes about 80 bytes for each
+allocation. The stack traces take about 10 MB by default.
+
+Each report reads the hash map of the owners, which takes about 0.3 seconds
+for 500000 outstanding allocations. With \-C, a report reads only the counts
+of the stack traces, which takes about a millisecond. \-C does not reduce the
+overhead of tracing, which is mostly the stack traces.
 
 To check the rate of page allocations, count the tracepoint with perf:
 

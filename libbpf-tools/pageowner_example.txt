@@ -234,13 +234,54 @@ with page_owner_sort from tools/mm of the kernel source:
 # ./page_owner_sort -m page_owner_full.txt sorted_page_owner.txt
 
 
+-C only counts the outstanding pages of each stack trace in the kernel, like
+/sys/kernel/debug/page_owner_stacks/show_stacks, instead of recording the owner
+of each allocation. This takes less memory, and a report only reads the counts
+instead of all the outstanding allocations, which makes it cheap even when
+there are millions of them, e.g. to watch the pages every minute for hours.
+Here, again with 100 pipes filled:
+
+# ./pageowner -C -T 2 4 1
+Tracing page allocations... Hit Ctrl-C to end.
+[06:59:22] Top 2 stacks with outstanding pages:
+
+1600 pages (6400 KiB) in 1600 allocations from stack
+	__alloc_frozen_pages_noprof+0x26b
+	alloc_pages_mpol+0x86
+	alloc_pages_noprof+0x4c
+	anon_pipe_write+0x1a8
+	vfs_write+0x400
+	ksys_write+0xc3
+	do_syscall_64+0x71
+	entry_SYSCALL_64_after_hwframe+0x76
+
+16 pages (64 KiB) in 4 allocations from stack
+	__alloc_frozen_pages_noprof+0x26b
+	alloc_pages_mpol+0x86
+	allocate_slab+0x358
+	___slab_alloc+0x835
+	__slab_alloc.isra.0+0x2b
+	__kmalloc_noprof+0x411
+	alloc_pipe_info+0xd7
+	create_pipe_files+0x3f
+	do_pipe2+0x55
+	__x64_sys_pipe2+0x14
+	do_syscall_64+0x71
+	entry_SYSCALL_64_after_hwframe+0x76
+
+Total: 1676 pages (6704 KiB) in 1655 allocations
+
+The output is the same, but an allocation that was split and partly freed is
+counted once for each remaining block, and -d cannot be used with -C.
+
+
 USAGE message:
 
 # ./pageowner --help
 Usage: pageowner [OPTION...]
 Show the owners of outstanding page allocations, like page_owner.
 
-USAGE: pageowner [-h] [-v] [-p PID] [-T TOP] [-d] [interval] [count]
+USAGE: pageowner [-h] [-v] [-p PID] [-T TOP] [-d | -C] [interval] [count]
 
 EXAMPLES:
     pageowner            # summarize outstanding pages by stack on Ctrl-C
@@ -248,7 +289,10 @@ EXAMPLES:
     pageowner -p 181     # only track pages allocated by PID 181
     pageowner -T 3       # show the top 3 stacks only
     pageowner -d         # dump each allocation in page_owner format
+    pageowner -C 5       # count pages by stack in the kernel, every 5s
 
+  -C, --combined-only        Only count the outstanding pages of each stack, in
+                             the kernel
   -d, --dump                 Dump each outstanding allocation like
                              /sys/kernel/debug/page_owner
       --max-allocs=MAX-ALLOCS   the number of outstanding allocations that can

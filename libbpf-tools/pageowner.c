@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <limits.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,6 +38,8 @@
 #define OPT_MAX_ALLOCS			3 /* --max-allocs */
 
 #define MAX_GFP_FLAGS			32
+/* room for the errors that bpf_get_stackid() returns instead of stack ids */
+#define MAX_STACK_ERRORS		8
 
 static struct env {
 	pid_t pid;
@@ -44,6 +47,7 @@ static struct env {
 	int count;
 	int top;
 	bool dump;
+	bool combined_only;
 	int max_allocs;
 	int stack_storage_size;
 	int perf_max_stack_depth;
@@ -78,6 +82,9 @@ static unsigned long *ips;
 static __u64 *keys;
 static struct page_info *vals;
 static __u32 *idx;
+static __s32 *count_keys;
+static struct stack_count *counts;
+static __u32 max_counts;
 static long page_kib;
 
 const char *argp_program_version = "pageowner 0.1";
@@ -86,20 +93,23 @@ const char *argp_program_bug_address =
 const char argp_program_doc[] =
 "Show the owners of outstanding page allocations, like page_owner.\n"
 "\n"
-"USAGE: pageowner [-h] [-v] [-p PID] [-T TOP] [-d] [interval] [count]\n"
+"USAGE: pageowner [-h] [-v] [-p PID] [-T TOP] [-d | -C] [interval] [count]\n"
 "\n"
 "EXAMPLES:\n"
 "    pageowner            # summarize outstanding pages by stack on Ctrl-C\n"
 "    pageowner 5 3        # summarize every 5 seconds, 3 times\n"
 "    pageowner -p 181     # only track pages allocated by PID 181\n"
 "    pageowner -T 3       # show the top 3 stacks only\n"
-"    pageowner -d         # dump each allocation in page_owner format\n";
+"    pageowner -d         # dump each allocation in page_owner format\n"
+"    pageowner -C 5       # count pages by stack in the kernel, every 5s\n";
 
 static const struct argp_option opts[] = {
 	{ "pid", 'p', "PID", 0, "Only track pages allocated by this process", 0 },
 	{ "top", 'T', "TOP", 0, "Show only this many top stacks (default 10)", 0 },
 	{ "dump", 'd', NULL, 0,
 	  "Dump each outstanding allocation like /sys/kernel/debug/page_owner", 0 },
+	{ "combined-only", 'C', NULL, 0,
+	  "Only count the outstanding pages of each stack, in the kernel", 0 },
 	{ "max-allocs", OPT_MAX_ALLOCS, "MAX-ALLOCS", 0,
 	  "the number of outstanding allocations that can be tracked (default "
 	  "1048576, or the number of pages in the system if smaller)", 0 },
@@ -145,6 +155,9 @@ static error_t parse_arg(int key, char *arg, struct argp_state *state)
 		break;
 	case 'd':
 		env.dump = true;
+		break;
+	case 'C':
+		env.combined_only = true;
 		break;
 	case OPT_MAX_ALLOCS:
 		env.max_allocs = parse_int(arg, "max allocs", state);
@@ -322,34 +335,12 @@ static int cmp_pfn(const void *a, const void *b)
 	return x < y ? -1 : x > y;
 }
 
-static int print_summary(int stack_fd, __u32 nr)
+static void print_stats(int stack_fd, struct stack_stat *stats, __u32 nr_stats)
 {
 	__u64 total_pages = 0, total_allocs = 0;
-	const struct page_info *info, *prev = NULL;
-	struct stack_stat *stats, *stat = NULL;
-	__u32 i, nr_stats = 0;
 	char ts[32];
+	__u32 i;
 
-	stats = calloc(nr ? nr : 1, sizeof(*stats));
-	if (!stats) {
-		warn("failed to allocate memory\n");
-		return -1;
-	}
-
-	qsort(vals, nr, sizeof(*vals), cmp_info);
-	for (i = 0; i < nr; i++) {
-		info = &vals[i];
-		if (!stat || stat->stack_id != stack_key(info)) {
-			stat = &stats[nr_stats++];
-			stat->stack_id = stack_key(info);
-			prev = NULL;
-		}
-		stat->nr_pages += 1ULL << info->order;
-		/* the blocks split from an allocation share its time and pid */
-		if (!prev || prev->ts != info->ts || prev->pid != info->pid)
-			stat->nr_allocs++;
-		prev = info;
-	}
 	qsort(stats, nr_stats, sizeof(*stats), cmp_stat);
 
 	str_timestamp("%H:%M:%S", ts, sizeof(ts));
@@ -370,7 +361,82 @@ static int print_summary(int stack_fd, __u32 nr)
 	       (unsigned long long)total_pages,
 	       (unsigned long long)total_pages * page_kib,
 	       (unsigned long long)total_allocs);
+}
 
+/* summarize the owners of the outstanding blocks by stack */
+static int print_summary(int stack_fd, __u32 nr, __u32 *nr_no_stack)
+{
+	const struct page_info *info, *prev = NULL;
+	struct stack_stat *stats, *stat = NULL;
+	__u32 i, nr_stats = 0;
+
+	stats = calloc(nr ? nr : 1, sizeof(*stats));
+	if (!stats) {
+		warn("failed to allocate memory\n");
+		return -1;
+	}
+
+	qsort(vals, nr, sizeof(*vals), cmp_info);
+	for (i = 0; i < nr; i++) {
+		info = &vals[i];
+		if (!stat || stat->stack_id != stack_key(info)) {
+			stat = &stats[nr_stats++];
+			stat->stack_id = stack_key(info);
+			prev = NULL;
+		}
+		stat->nr_pages += 1ULL << info->order;
+		/* the blocks split from an allocation share its time and pid */
+		if (!prev || prev->ts != info->ts || prev->pid != info->pid)
+			stat->nr_allocs++;
+		prev = info;
+		*nr_no_stack += info->stack_id < 0;
+	}
+
+	print_stats(stack_fd, stats, nr_stats);
+	free(stats);
+	return 0;
+}
+
+/* summarize the pages counted by stack in the kernel, with -C */
+static int print_combined(int counts_fd, int stack_fd, __u32 *nr_no_stack)
+{
+	struct stack_stat *stats, *stat, *no_stack = NULL;
+	__s32 invalid_key = INT_MIN;
+	__u32 i, nr = max_counts, nr_stats = 0;
+
+	if (dump_hash(counts_fd, count_keys, sizeof(*count_keys), counts,
+		      sizeof(*counts), &nr, &invalid_key, false)) {
+		warn("failed to read the stack counts map: %s\n", strerror(errno));
+		return -1;
+	}
+
+	stats = calloc(nr ? nr : 1, sizeof(*stats));
+	if (!stats) {
+		warn("failed to allocate memory\n");
+		return -1;
+	}
+
+	for (i = 0; i < nr; i++) {
+		if (counts[i].nr_pages <= 0)
+			continue;
+		/* put all the allocations without a stack trace together */
+		if (count_keys[i] < 0 && no_stack) {
+			stat = no_stack;
+		} else {
+			stat = &stats[nr_stats++];
+			stat->stack_id = count_keys[i] < 0 ? -1 : count_keys[i];
+			if (count_keys[i] < 0)
+				no_stack = stat;
+		}
+		stat->nr_pages += counts[i].nr_pages;
+		/* blocks split from an allocation are counted separately */
+		if (counts[i].nr_blocks > 0)
+			stat->nr_allocs += counts[i].nr_blocks;
+	}
+	if (no_stack)
+		*nr_no_stack = no_stack->nr_allocs;
+
+	print_stats(stack_fd, stats, nr_stats);
 	free(stats);
 	return 0;
 }
@@ -414,26 +480,30 @@ static __u64 prog_misses(const struct bpf_program *prog)
 	return info.recursion_misses;
 }
 
-static int print_report(struct pageowner_bpf *obj, int pages_fd, int stack_fd)
+static int print_report(struct pageowner_bpf *obj, int pages_fd, int counts_fd,
+			int stack_fd)
 {
 	__u64 invalid_key = -1, nr_untracked, nr_lost_allocs, nr_lost_frees;
 	__u32 i, nr = env.max_allocs, nr_no_stack = 0;
 	int err = 0;
 
-	/* the PFN of a failed allocation, -1, is never used as a key */
-	if (dump_hash(pages_fd, keys, sizeof(*keys), vals, sizeof(*vals), &nr,
-		      &invalid_key, false)) {
-		warn("failed to read the pages map: %s\n", strerror(errno));
-		return -1;
+	if (env.combined_only) {
+		err = print_combined(counts_fd, stack_fd, &nr_no_stack);
+	} else {
+		/* the PFN of a failed allocation, -1, is never used as a key */
+		if (dump_hash(pages_fd, keys, sizeof(*keys), vals, sizeof(*vals),
+			      &nr, &invalid_key, false)) {
+			warn("failed to read the pages map: %s\n", strerror(errno));
+			return -1;
+		}
+		if (env.dump) {
+			for (i = 0; i < nr; i++)
+				nr_no_stack += vals[i].stack_id < 0;
+			print_dump(stack_fd, nr);
+		} else {
+			err = print_summary(stack_fd, nr, &nr_no_stack);
+		}
 	}
-
-	for (i = 0; i < nr; i++)
-		nr_no_stack += vals[i].stack_id < 0;
-
-	if (env.dump)
-		print_dump(stack_fd, nr);
-	else
-		err = print_summary(stack_fd, nr);
 	fflush(stdout);
 
 	nr_untracked = obj->bss->nr_untracked;
@@ -465,12 +535,17 @@ int main(int argc, char **argv)
 		.doc = argp_program_doc,
 	};
 	struct pageowner_bpf *obj = NULL;
-	int pages_fd, stack_fd;
+	int pages_fd, counts_fd, stack_fd;
+	bool nomem;
 	int err;
 
 	err = argp_parse(&argp, argc, argv, 0, NULL, NULL);
 	if (err)
 		return err;
+	if (env.dump && env.combined_only) {
+		warn("-d and -C can't be used together\n");
+		return 1;
+	}
 
 	libbpf_set_print(libbpf_print_fn);
 
@@ -498,8 +573,16 @@ int main(int argc, char **argv)
 
 	obj->rodata->target_tgid = env.pid;
 	obj->rodata->self_tgid = getpid();
+	obj->rodata->combined_only = env.combined_only;
 
 	bpf_map__set_max_entries(obj->maps.pages, env.max_allocs);
+	if (env.combined_only) {
+		/* the stack and the order are all that is needed of a block */
+		bpf_map__set_value_size(obj->maps.pages,
+					offsetof(struct page_info, ts));
+		max_counts = env.stack_storage_size + MAX_STACK_ERRORS;
+		bpf_map__set_max_entries(obj->maps.stack_counts, max_counts);
+	}
 	bpf_map__set_value_size(obj->maps.stackmap,
 				env.perf_max_stack_depth * sizeof(unsigned long));
 	bpf_map__set_max_entries(obj->maps.stackmap, env.stack_storage_size);
@@ -510,11 +593,18 @@ int main(int argc, char **argv)
 		goto cleanup;
 	}
 
-	keys = calloc(env.max_allocs, sizeof(*keys));
-	vals = calloc(env.max_allocs, sizeof(*vals));
-	idx = calloc(env.max_allocs, sizeof(*idx));
+	if (env.combined_only) {
+		count_keys = calloc(max_counts, sizeof(*count_keys));
+		counts = calloc(max_counts, sizeof(*counts));
+		nomem = !count_keys || !counts;
+	} else {
+		keys = calloc(env.max_allocs, sizeof(*keys));
+		vals = calloc(env.max_allocs, sizeof(*vals));
+		idx = calloc(env.max_allocs, sizeof(*idx));
+		nomem = !keys || !vals || !idx;
+	}
 	ips = calloc(env.perf_max_stack_depth, sizeof(*ips));
-	if (!keys || !vals || !idx || !ips) {
+	if (nomem || !ips) {
 		warn("failed to allocate memory\n");
 		err = 1;
 		goto cleanup;
@@ -552,8 +642,9 @@ int main(int argc, char **argv)
 		"Tracing page allocations... Hit Ctrl-C to end.\n");
 
 	pages_fd = bpf_map__fd(obj->maps.pages);
+	counts_fd = bpf_map__fd(obj->maps.stack_counts);
 	stack_fd = bpf_map__fd(obj->maps.stackmap);
-	if (pages_fd < 0 || stack_fd < 0) {
+	if (pages_fd < 0 || counts_fd < 0 || stack_fd < 0) {
 		warn("failed to get map fds\n");
 		err = 1;
 		goto cleanup;
@@ -562,7 +653,7 @@ int main(int argc, char **argv)
 	while (1) {
 		sleep(env.interval);
 
-		err = print_report(obj, pages_fd, stack_fd);
+		err = print_report(obj, pages_fd, counts_fd, stack_fd);
 		if (err || exiting || --env.count == 0)
 			break;
 	}
@@ -575,6 +666,8 @@ cleanup:
 	free(keys);
 	free(vals);
 	free(idx);
+	free(count_keys);
+	free(counts);
 	free(ips);
 
 	return err != 0;
