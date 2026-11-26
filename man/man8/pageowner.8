@@ -1,0 +1,194 @@
+.TH pageowner 8  "2026-11-26" "USER COMMANDS"
+.SH NAME
+pageowner \- Show the owners of outstanding page allocations, like page_owner.
+Uses Linux eBPF/bcc.
+.SH SYNOPSIS
+.B pageowner [\-h] [\-v] [\-p PID] [\-T TOP] [\-d] [\-\-max\-allocs MAX_ALLOCS]
+.B [\-\-stack\-storage\-size SIZE] [\-\-perf\-max\-stack\-depth DEPTH]
+.B [interval] [count]
+.SH DESCRIPTION
+pageowner records who allocated each block of pages from the page allocator:
+the kernel stack trace, the task, the gfp mask, the order and the time of the
+allocation. When a block is freed, its record is dropped, so the records show
+which pages are still allocated, and by whom.
+
+By default, pageowner summarizes these outstanding pages by kernel stack trace
+when Ctrl-C is hit, or every interval seconds, which shows the code paths that
+hold the most pages. This is useful to find out where kernel memory that does
+not show up in the RSS of any process goes, e.g. for a page leak in a driver,
+or memory held in pipes or socket buffers, and which code paths allocate pages
+that cause fragmentation. With \-d, pageowner instead prints each outstanding
+allocation in the format of /sys/kernel/debug/page_owner, so that the output
+can be post-processed by tools written for page_owner, such as page_owner_sort
+in tools/mm of the kernel source.
+
+This is like page_owner of the kernel (Documentation/mm/page_owner.rst), but
+works on kernels built without CONFIG_PAGE_OWNER or booted without
+page_owner=on, as most production kernels are, and needs no reboot. Unlike
+page_owner, it only knows about pages allocated while it runs.
+
+When an allocation is split, e.g. by split_page() or when a transparent huge
+page is split, and its parts are freed one by one, pageowner keeps tracking
+the parts that are still allocated.
+
+This works by tracing the kmem:mm_page_alloc and kmem:mm_page_free
+tracepoints.
+
+Since this uses BPF, only the root user can use this tool.
+.SH REQUIREMENTS
+Linux 5.3 or later with CONFIG_BPF, CONFIG_BPF_EVENTS and kernel BTF
+(CONFIG_DEBUG_INFO_BTF), or BTF for the kernel from BTFHub.
+.SH OPTIONS
+.TP
+\-h
+Print usage message.
+.TP
+\-v
+Print verbose debug output.
+.TP
+\-p PID
+Only track pages allocated by this process (filtered in-kernel). Pages
+allocated on its behalf by other tasks, e.g. by kernel threads, are not
+tracked.
+.TP
+\-T TOP
+Show only the top TOP stacks, sorted by the number of outstanding pages.
+The default is 10. Ignored with \-d.
+.TP
+\-d
+Print each outstanding allocation in the format of
+/sys/kernel/debug/page_owner, ordered by PFN, instead of the summary.
+.TP
+\-\-max\-allocs MAX_ALLOCS
+The number of outstanding allocations that can be tracked. The default is
+1048576, or the number of pages in the system if that is smaller.
+.TP
+\-\-stack\-storage\-size SIZE
+The number of unique stack traces that can be stored. The default is 10240.
+.TP
+\-\-perf\-max\-stack\-depth DEPTH
+The maximum depth of the stack traces. The default is 127.
+.TP
+interval
+Print a report every interval seconds, instead of only when Ctrl-C is hit.
+.TP
+count
+Number of reports to print before exiting.
+.SH EXAMPLES
+.TP
+Summarize outstanding pages by kernel stack when Ctrl-C is hit:
+#
+.B pageowner
+.TP
+Summarize every 5 seconds, 3 times:
+#
+.B pageowner 5 3
+.TP
+Only track pages allocated by PID 181:
+#
+.B pageowner \-p 181
+.TP
+Show only the top 3 stacks:
+#
+.B pageowner \-T 3
+.TP
+Save the outstanding allocations in page_owner format, and sort them by memory with page_owner_sort of the kernel:
+#
+.B pageowner \-d > page_owner_full.txt
+.br
+#
+.B page_owner_sort \-m page_owner_full.txt sorted_page_owner.txt
+.SH FIELDS
+The summary shows, for each stack trace:
+.TP
+pages
+The number of outstanding pages allocated from the stack trace, and their
+size in KiB.
+.TP
+allocations
+The number of allocations these pages belong to.
+.PP
+The dump (\-d) shows, for each outstanding allocation:
+.TP
+order
+The order of the block: it consists of 2^order pages. It is lower than the
+order of the original allocation, if the allocation was split and some of its
+parts were freed.
+.TP
+mask
+The gfp mask of the allocation. The names of the flags are shown on Linux 6.9
+and later, which describe the flags in BTF.
+.TP
+pid, tgid, comm
+The thread ID, process ID and command name of the task that allocated the
+pages. In interrupt context, this is the interrupted task.
+.TP
+ts
+The time of the allocation, in nanoseconds since boot (CLOCK_MONOTONIC).
+.TP
+PFN
+The page frame number of the first page of the block.
+.TP
+type
+The migrate type of the allocation, derived from the gfp mask.
+.SH OVERHEAD
+Every page allocation and free is traced: for each allocation, pageowner
+records a kernel stack trace and stores the owner in a hash map, and for each
+free, it looks the owner up and removes it. The stack trace takes most of the
+time, about 85% in the microbenchmark below. The overhead is proportional to
+the rate of page allocations, which can be high: hundreds of thousands to
+millions per second during heavy page fault or page cache activity. In a
+worst-case microbenchmark that did nothing but fault in and free pages on a
+single CPU, at about 780000 pages per second, pageowner reduced the
+throughput by about 50% (memleak, which also traces page allocations, by about
+55%). Frees of pages that are not tracked, e.g. allocated before pageowner
+started or filtered out by \-p, cost less: the same microbenchmark slowed down
+by about 20%. Use \-p to reduce the overhead to the pages of one process, and a
+smaller \-\-perf\-max\-stack\-depth, which truncates the stack traces, to make
+them cheaper.
+
+The hash map of the owners is preallocated, and takes about 120 bytes of
+kernel memory for each allocation that it can track: about 125 MB for 1048576
+allocations, the default unless the system has fewer pages. Use
+\-\-max\-allocs to reduce it. The stack traces take about 10 MB by default.
+
+To check the rate of page allocations, count the tracepoint with perf:
+
+#
+.B perf stat \-e kmem:mm_page_alloc \-a \-\- sleep 10
+.SH CAVEATS
+Only pages allocated while pageowner runs are tracked.
+
+Only allocations reported by the kmem:mm_page_alloc tracepoint are tracked.
+These do not include pages allocated by alloc_contig_range(), which is used by
+e.g. CMA, nor, before Linux 7.4, by the bulk allocator, alloc_pages_bulk(),
+which is used by e.g. vmalloc() and some network drivers.
+
+When a page is migrated, e.g. by compaction or NUMA balancing, the new page
+is reported as allocated by the migration, while page_owner keeps the
+original owner.
+
+The kernel does not run a BPF program if another one is running on the same
+CPU, e.g. when a page is freed from an interrupt that arrived while a program
+of pageowner was running. Such missed frees, which are more likely under heavy
+load, leave pages reported as outstanding until they are allocated again, and
+pageowner warns about them.
+
+The stack traces are stored until pageowner exits, even after their pages are
+freed. If the storage fills up, new allocations are reported without a stack
+trace, and pageowner warns about them.
+.SH SOURCE
+This is from bcc.
+.IP
+https://github.com/iovisor/bcc
+.PP
+Also look in the bcc distribution for a companion _examples.txt file containing
+example usage, output, and commentary for this tool.
+.SH OS
+Linux
+.SH STABILITY
+Unstable - in development.
+.SH AUTHOR
+Bojun Seo
+.SH SEE ALSO
+memleak(8), slabratetop(8)
