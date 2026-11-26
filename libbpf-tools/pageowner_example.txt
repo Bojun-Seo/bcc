@@ -1,0 +1,272 @@
+Demonstrations of pageowner, the Linux BPF CO-RE version.
+
+
+pageowner shows who allocated the pages that are still allocated, like the
+page_owner feature of the kernel (CONFIG_PAGE_OWNER). It records the kernel
+stack trace, task, gfp mask, order and time of each page allocation, drops the
+record when the pages are freed, and summarizes the remaining, outstanding,
+pages by stack trace. page_owner needs a kernel built with CONFIG_PAGE_OWNER
+and booted with page_owner=on, which production systems rarely are. pageowner
+works on a running kernel without a reboot, but only sees the pages allocated
+after it started.
+
+This helps when memory goes somewhere that the RSS of processes does not
+explain: kernel memory allocated directly from the page allocator. For
+example, a process filled 100 pipes that nobody reads, so the kernel keeps the
+data in the buffers of the pipes:
+
+# ./pageowner
+Tracing page allocations... Hit Ctrl-C to end.
+^C
+[05:55:51] Top 10 stacks with outstanding pages:
+
+1600 pages (6400 KiB) in 1600 allocations from stack
+	__alloc_frozen_pages_noprof+0x26b
+	alloc_pages_mpol+0x86
+	alloc_pages_noprof+0x4c
+	anon_pipe_write+0x1a8
+	vfs_write+0x400
+	ksys_write+0xc3
+	do_syscall_64+0x71
+	entry_SYSCALL_64_after_hwframe+0x76
+
+24 pages (96 KiB) in 6 allocations from stack
+	__alloc_frozen_pages_noprof+0x26b
+	alloc_pages_mpol+0x86
+	allocate_slab+0x358
+	___slab_alloc+0x835
+	__slab_alloc.isra.0+0x2b
+	__kmalloc_noprof+0x411
+	alloc_pipe_info+0xd7
+	create_pipe_files+0x3f
+	do_pipe2+0x55
+	__x64_sys_pipe2+0x14
+	do_syscall_64+0x71
+	entry_SYSCALL_64_after_hwframe+0x76
+
+17 pages (68 KiB) in 17 allocations from stack
+	__alloc_frozen_pages_noprof+0x26b
+	alloc_pages_mpol+0x86
+	vma_alloc_folio_noprof+0x6a
+	do_anonymous_page+0x1ff
+	__handle_mm_fault+0xa64
+	handle_mm_fault+0xd0
+	exc_page_fault+0x176
+	asm_exc_page_fault+0x22
+
+[...]
+
+Total: 1692 pages (6768 KiB) in 1662 allocations
+
+The first stack shows that pipe writes allocated 1600 pages that are still
+allocated: 16 pages for each of the 100 pipes, 6400 KiB in total. None of them
+shows up in the RSS of the process. The second stack shows the slab pages
+behind the metadata of the pipes: 6 allocations of 4 pages each. The third
+one is ordinary anonymous memory of processes, which page faults allocated.
+The stacks are sorted by the number of pages, and only the top 10 are shown;
+the last line counts all outstanding pages.
+
+
+Running with an interval prints a summary every interval seconds, which shows
+how the outstanding pages grow. Here -T 1 shows only the top stack while 200
+pipes are being filled, every 2 seconds, 4 times:
+
+# ./pageowner -T 1 2 4
+Tracing page allocations... Hit Ctrl-C to end.
+[05:56:05] Top 1 stacks with outstanding pages:
+
+960 pages (3840 KiB) in 960 allocations from stack
+	__alloc_frozen_pages_noprof+0x26b
+	alloc_pages_mpol+0x86
+	alloc_pages_noprof+0x4c
+	anon_pipe_write+0x1a8
+	vfs_write+0x400
+	ksys_write+0xc3
+	do_syscall_64+0x71
+	entry_SYSCALL_64_after_hwframe+0x76
+
+Total: 997 pages (3988 KiB) in 997 allocations
+
+[05:56:07] Top 1 stacks with outstanding pages:
+
+2512 pages (10048 KiB) in 2512 allocations from stack
+	__alloc_frozen_pages_noprof+0x26b
+	alloc_pages_mpol+0x86
+	alloc_pages_noprof+0x4c
+	anon_pipe_write+0x1a8
+	vfs_write+0x400
+	ksys_write+0xc3
+	do_syscall_64+0x71
+	entry_SYSCALL_64_after_hwframe+0x76
+
+Total: 2719 pages (10876 KiB) in 2701 allocations
+
+[05:56:09] Top 1 stacks with outstanding pages:
+
+3200 pages (12800 KiB) in 3200 allocations from stack
+	__alloc_frozen_pages_noprof+0x26b
+	alloc_pages_mpol+0x86
+	alloc_pages_noprof+0x4c
+	anon_pipe_write+0x1a8
+	vfs_write+0x400
+	ksys_write+0xc3
+	do_syscall_64+0x71
+	entry_SYSCALL_64_after_hwframe+0x76
+
+Total: 3471 pages (13884 KiB) in 3444 allocations
+
+[05:56:11] Top 1 stacks with outstanding pages:
+
+3200 pages (12800 KiB) in 3200 allocations from stack
+	__alloc_frozen_pages_noprof+0x26b
+	alloc_pages_mpol+0x86
+	alloc_pages_noprof+0x4c
+	anon_pipe_write+0x1a8
+	vfs_write+0x400
+	ksys_write+0xc3
+	do_syscall_64+0x71
+	entry_SYSCALL_64_after_hwframe+0x76
+
+Total: 3471 pages (13884 KiB) in 3444 allocations
+
+The pages grew while the pipes were filled, and then stayed allocated.
+
+
+When an allocation is split and its parts are freed one by one, pageowner
+keeps tracking the parts that are still allocated. Here a test program, PID
+3231, faulted in a transparent huge page (THP), split it with MADV_COLD on its
+first half, unmapped the first half, and then the rest. -p tracks the pages
+allocated by this process only:
+
+# ./pageowner -p 3231 -T 1 2 4
+Tracing page allocations... Hit Ctrl-C to end.
+[05:56:38] Top 1 stacks with outstanding pages:
+
+512 pages (2048 KiB) in 1 allocations from stack
+	__alloc_frozen_pages_noprof+0x26b
+	alloc_pages_mpol+0xd1
+	vma_alloc_folio_noprof+0x6a
+	vma_alloc_anon_folio_pmd+0x32
+	do_huge_pmd_anonymous_page+0xa2
+	__handle_mm_fault+0xc9f
+	handle_mm_fault+0xd0
+	exc_page_fault+0x176
+	asm_exc_page_fault+0x22
+
+Total: 554 pages (2216 KiB) in 43 allocations
+
+[05:56:40] Top 1 stacks with outstanding pages:
+
+512 pages (2048 KiB) in 1 allocations from stack
+	__alloc_frozen_pages_noprof+0x26b
+	alloc_pages_mpol+0xd1
+	vma_alloc_folio_noprof+0x6a
+	vma_alloc_anon_folio_pmd+0x32
+	do_huge_pmd_anonymous_page+0xa2
+	__handle_mm_fault+0xc9f
+	handle_mm_fault+0xd0
+	exc_page_fault+0x176
+	asm_exc_page_fault+0x22
+
+Total: 554 pages (2216 KiB) in 43 allocations
+
+[05:56:42] Top 1 stacks with outstanding pages:
+
+256 pages (1024 KiB) in 1 allocations from stack
+	__alloc_frozen_pages_noprof+0x26b
+	alloc_pages_mpol+0xd1
+	vma_alloc_folio_noprof+0x6a
+	vma_alloc_anon_folio_pmd+0x32
+	do_huge_pmd_anonymous_page+0xa2
+	__handle_mm_fault+0xc9f
+	handle_mm_fault+0xd0
+	exc_page_fault+0x176
+	asm_exc_page_fault+0x22
+
+Total: 298 pages (1192 KiB) in 43 allocations
+
+[05:56:44] Top 1 stacks with outstanding pages:
+
+10 pages (40 KiB) in 10 allocations from stack
+	__alloc_frozen_pages_noprof+0x26b
+	alloc_pages_mpol+0x86
+	vma_alloc_folio_noprof+0x6a
+	do_anonymous_page+0x1ff
+	__handle_mm_fault+0xa64
+	handle_mm_fault+0xd0
+	exc_page_fault+0x176
+	asm_exc_page_fault+0x22
+
+Total: 41 pages (164 KiB) in 41 allocations
+
+The THP stayed allocated as a whole after the split (512 pages), half of it
+after the first half was unmapped (256 pages, still counted as 1 allocation),
+and none of it after the rest was unmapped.
+
+
+-d prints each outstanding allocation in the format of
+/sys/kernel/debug/page_owner instead, ordered by PFN, with the task and the gfp
+mask. Here for the pipes of a process, PID 3217:
+
+# ./pageowner -p 3217 -d
+Tracing page allocations... Hit Ctrl-C to end.
+^C
+[...]
+Page allocated via order 0, mask 0x500cc2(__GFP_HIGHMEM|__GFP_IO|__GFP_FS|__GFP_DIRECT_RECLAIM|__GFP_KSWAPD_RECLAIM|__GFP_HARDWALL|__GFP_ACCOUNT), pid 3217, tgid 3217 (pipefill), ts 2845398990479 ns
+PFN 0x1038ed type Unmovable
+ __alloc_frozen_pages_noprof+0x26b
+ alloc_pages_mpol+0x86
+ alloc_pages_noprof+0x4c
+ anon_pipe_write+0x1a8
+ vfs_write+0x400
+ ksys_write+0xc3
+ do_syscall_64+0x71
+ entry_SYSCALL_64_after_hwframe+0x76
+
+[...]
+
+The names of the gfp flags are shown on Linux 6.9 and later; older kernels
+show the mask only. As only the dump is written to stdout, it can be saved and
+post-processed by tools that read page_owner output, e.g. sorted by memory
+with page_owner_sort from tools/mm of the kernel source:
+
+# ./pageowner -d > page_owner_full.txt
+# ./page_owner_sort -m page_owner_full.txt sorted_page_owner.txt
+
+
+USAGE message:
+
+# ./pageowner --help
+Usage: pageowner [OPTION...]
+Show the owners of outstanding page allocations, like page_owner.
+
+USAGE: pageowner [-h] [-v] [-p PID] [-T TOP] [-d] [interval] [count]
+
+EXAMPLES:
+    pageowner            # summarize outstanding pages by stack on Ctrl-C
+    pageowner 5 3        # summarize every 5 seconds, 3 times
+    pageowner -p 181     # only track pages allocated by PID 181
+    pageowner -T 3       # show the top 3 stacks only
+    pageowner -d         # dump each allocation in page_owner format
+
+  -d, --dump                 Dump each outstanding allocation like
+                             /sys/kernel/debug/page_owner
+      --max-allocs=MAX-ALLOCS   the number of outstanding allocations that can
+                             be tracked (default 1048576, or the number of
+                             pages in the system if smaller)
+      --perf-max-stack-depth=PERF-MAX-STACK-DEPTH
+                             the limit for kernel stack traces (default 127)
+  -p, --pid=PID              Only track pages allocated by this process
+      --stack-storage-size=STACK-STORAGE-SIZE
+                             the number of unique stack traces that can be
+                             stored and displayed (default 10240)
+  -T, --top=TOP              Show only this many top stacks (default 10)
+  -v, --verbose              Verbose debug output
+  -?, --help                 Give this help list
+      --usage                Give a short usage message
+  -V, --version              Print program version
+
+Mandatory or optional arguments to long options are also mandatory or optional
+for any corresponding short options.
+
+Report bugs to https://github.com/iovisor/bcc/tree/master/libbpf-tools.
