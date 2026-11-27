@@ -180,7 +180,7 @@ BPF_HASH(memptrs, u32, u64);
 BPF_STACK_TRACE(stack_traces, 10240);
 BPF_HASH(combined_allocs, u64, struct combined_alloc_info_t, 10240);
 
-static inline void update_statistics_add(u64 stack_id, u64 sz) {
+static inline void update_statistics_add(u64 stack_id, u64 sz, u64 n) {
         struct combined_alloc_info_t *existing_cinfo;
         struct combined_alloc_info_t cinfo = {0, 0};
 
@@ -192,7 +192,7 @@ static inline void update_statistics_add(u64 stack_id, u64 sz) {
                         return;
         }
         __sync_fetch_and_add(&existing_cinfo->total_size, sz);
-        __sync_fetch_and_add(&existing_cinfo->number_of_allocs, 1);
+        __sync_fetch_and_add(&existing_cinfo->number_of_allocs, n);
 }
 
 static inline void update_statistics_del(u64 stack_id, u64 sz) {
@@ -244,7 +244,7 @@ static inline int gen_alloc_exit2(struct pt_regs *ctx, u64 address, u32 type_ind
                 info.timestamp_ns = bpf_ktime_get_ns();
                 info.stack_id = stack_traces.get_stackid(ctx, STACK_FLAGS);
                 allocs.update(&address, &info);
-                update_statistics_add(info.stack_id, info.size);
+                update_statistics_add(info.stack_id, info.size, 1);
         }
 
         if (SHOULD_PRINT) {
@@ -393,6 +393,7 @@ TRACEPOINT_PROBE(kmem, kmem_cache_alloc_node) {
 """
 
 bpf_source_kernel = """
+#include <linux/mmzone.h>
 
 TRACEPOINT_PROBE(kmem, kmalloc) {
         if (WORKAROUND_MISSING_FREE)
@@ -421,8 +422,70 @@ TRACEPOINT_PROBE(kmem, mm_page_alloc) {
         return gen_alloc_exit2((struct pt_regs *)args, args->pfn, KERNEL);
 }
 
+/* NR_PAGE_ORDERS, or MAX_ORDER before v6.8: zone->free_area[] has one each */
+#define NR_ORDERS \\
+        (sizeof(((struct zone *)0)->free_area) / sizeof(struct free_area))
+
 TRACEPOINT_PROBE(kmem, mm_page_free) {
-        return gen_free_enter((struct pt_regs *)args, (void *)args->pfn);
+        u64 pfn = args->pfn, head = pfn, size, buddy;
+        u64 added_size = 0, added = 0;
+        u32 order = args->order, o;
+        struct alloc_info_t *infop = 0, info = {0};
+
+        /*
+         * A page allocation is usually freed as a whole, but once it is
+         * split, e.g. by split_page() or when a THP is split, its parts are
+         * freed one by one. As buddy allocations are naturally aligned, the
+         * allocation that contains the freed block starts at its PFN aligned
+         * down to the order of the allocation, so look for it from the freed
+         * order upwards.
+         */
+        #pragma unroll
+        for (o = 0; o < NR_ORDERS; o++) {
+                if (o < order)
+                        continue;
+                head = pfn & ~((1ULL << o) - 1);
+                infop = allocs.lookup(&head);
+                if (infop)
+                        break;
+        }
+        if (infop == 0)
+                return 0;
+        /* a smaller allocation above the freed order does not contain it */
+        if (o > order && infop->size < ((u64)PAGE_SIZE << o))
+                return 0;
+
+        info = *infop;
+        /* someone else is freeing another part of the same allocation */
+        if (allocs.delete(&head))
+                return 0;
+        update_statistics_del(info.stack_id, info.size);
+
+        if (SHOULD_PRINT) {
+                bpf_trace_printk("free entered, address = %lx, size = %lu\\n",
+                                 pfn, (u64)PAGE_SIZE << order);
+        }
+
+        /*
+         * If only a part was freed, keep tracking the rest of the allocation
+         * as buddy blocks, one of each order from the freed one up to that of
+         * the allocation, like expand() of the page allocator.
+         */
+        size = info.size;
+        #pragma unroll
+        for (o = 0; o < NR_ORDERS; o++) {
+                if (o < order || ((u64)PAGE_SIZE << o) >= size)
+                        continue;
+                buddy = (pfn & ~((1ULL << o) - 1)) ^ (1ULL << o);
+                info.size = (u64)PAGE_SIZE << o;
+                if (allocs.update(&buddy, &info))
+                        continue;
+                added_size += info.size;
+                added++;
+        }
+        if (added)
+                update_statistics_add(info.stack_id, added_size, added);
+        return 0;
 }
 """
 
