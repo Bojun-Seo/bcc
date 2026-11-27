@@ -393,6 +393,7 @@ TRACEPOINT_PROBE(kmem, kmem_cache_alloc_node) {
 """
 
 bpf_source_kernel = """
+#include <linux/mmzone.h>
 
 TRACEPOINT_PROBE(kmem, kmalloc) {
         if (WORKAROUND_MISSING_FREE)
@@ -421,8 +422,76 @@ TRACEPOINT_PROBE(kmem, mm_page_alloc) {
         return gen_alloc_exit2((struct pt_regs *)args, args->pfn, KERNEL);
 }
 
+/* the number of page orders: zone->free_area[] has one entry for each */
+#define NR_ORDERS \\
+        (sizeof(((struct zone *)0)->free_area) / sizeof(struct free_area))
+
 TRACEPOINT_PROBE(kmem, mm_page_free) {
-        return gen_free_enter((struct pt_regs *)args, (void *)args->pfn);
+        u64 pfn = args->pfn, head = pfn, size, buddy;
+        u32 order = args->order, o;
+        struct alloc_info_t *infop = 0, info = {0};
+
+        /*
+         * A page allocation is usually freed as a whole, but once it is
+         * split, e.g. by split_page() or when a THP is split, its parts are
+         * freed one by one. As buddy allocations are naturally aligned, the
+         * allocation that contains the freed block starts at its PFN aligned
+         * down to the order of the allocation, so look for it from the freed
+         * order upwards.
+         */
+        #pragma unroll
+        for (o = 0; o < NR_ORDERS; o++) {
+                if (o < order)
+                        continue;
+                /* the same head as at the order below, which is not tracked */
+                if (o > order && !(pfn & (1ULL << (o - 1))))
+                        continue;
+                head = pfn & ~((1ULL << o) - 1);
+                infop = allocs.lookup(&head);
+                if (infop)
+                        break;
+        }
+        if (infop == 0)
+                return 0;
+        /* a smaller allocation above the freed order does not contain it */
+        if (o > order && infop->size < ((u64)PAGE_SIZE << o))
+                return 0;
+
+        info = *infop;
+        /*
+         * Someone else is freeing another part of the same allocation. With
+         * no lock between the lookup and the delete, the part freed here is
+         * then missed, and stays reported in the rest of the allocation they
+         * keep.
+         */
+        if (allocs.delete(&head))
+                return 0;
+        update_statistics_del(info.stack_id, info.size);
+
+        if (SHOULD_PRINT) {
+                bpf_trace_printk("free entered, address = %lx, size = %lu\\n",
+                                 pfn, (u64)PAGE_SIZE << order);
+        }
+
+        /*
+         * If only a part was freed, keep tracking the rest of the allocation
+         * as buddy blocks, one of each order from the freed one up to that of
+         * the allocation, like expand() of the page allocator. Account each
+         * block on its own: summing them up across the unrolled loop would
+         * make verifiers without precision tracking (before v5.3) explore
+         * every combination of failed updates.
+         */
+        size = info.size;
+        #pragma unroll
+        for (o = 0; o < NR_ORDERS; o++) {
+                if (o < order || ((u64)PAGE_SIZE << o) >= size)
+                        continue;
+                buddy = (pfn & ~((1ULL << o) - 1)) ^ (1ULL << o);
+                info.size = (u64)PAGE_SIZE << o;
+                if (allocs.update(&buddy, &info) == 0)
+                        update_statistics_add(info.stack_id, info.size);
+        }
+        return 0;
 }
 """
 
